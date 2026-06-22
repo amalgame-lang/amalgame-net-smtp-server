@@ -1,0 +1,512 @@
+namespace Amalgame.Net.SmtpServer
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Crypto
+import Amalgame.Database.SQLite
+import Amalgame.Net.Mail
+import Amalgame.Tls
+
+@c {
+    #include <string.h>
+    #include <sys/socket.h>
+    #include <unistd.h>
+}
+
+// ═══════════════════════════════════════════════════════
+//  smtp_server.am  —  receiving SMTP server (ESMTP)
+// ═══════════════════════════════════════════════════════
+//
+// Phase 3 of the native Amalgame mail server. Two layers:
+//
+//   SmtpSession  — the ESMTP command state machine. Pure logic: you
+//                  feed it one command line at a time and it returns the
+//                  response to send back, accumulates the DATA payload,
+//                  authenticates (AUTH PLAIN / LOGIN against scrypt
+//                  hashes via amalgame-crypto Password.Verify — the same
+//                  hashes amalgame-auth stores, so one unified family
+//                  account), and on end-of-DATA delivers the message
+//                  into an `amalgame-net-mail-store` MailStore. It owns
+//                  NO socket and NO TLS, so it is fully unit-testable by
+//                  driving it with strings. STARTTLS is surfaced as a
+//                  signal (WantsTlsUpgrade) for the transport layer.
+//
+//   SmtpServer   — the transport: a TcpServer accept loop that drives a
+//                  SmtpSession per connection, performing the STARTTLS
+//                  upgrade via amalgame-tls. (Integration layer — see
+//                  SmtpServer below.)
+//
+// Receive-only by design: the server accepts mail and stores it locally;
+// it never forwards, so it is not an open relay. Submission auth gates
+// nothing to relay yet — it identifies the account. TLS is required
+// before AUTH (no credentials in the clear).
+//
+// Out of scope (v0.1.0): per-recipient mailbox routing (all accepted
+// mail → the configured mailbox, default "INBOX"); SIZE enforcement;
+// PIPELINING correctness under coalesced input; DKIM/SPF (later phases);
+// rate-limit / lockout (LoginGuard) — pre-exposure hardening, added at
+// the security-audit gate.
+
+// AUTH sub-state.
+//   0 = none, 1 = expecting AUTH PLAIN response line,
+//   2 = expecting AUTH LOGIN username, 3 = expecting AUTH LOGIN password
+public class SmtpSession {
+    public  Store:    MailStore
+    public  Users:    Map<string, string>   // username → scrypt hash
+    public  Host:     string
+    public  Mailbox:  string       // delivery target (default "INBOX")
+    public  TlsActive: bool         // set by the transport after STARTTLS
+    public  Authed:    bool
+    public  AuthUser:  string
+
+    private HeloDone:  bool
+    private From:      string
+    private Rcpts:     List<string>
+    private InData:    bool
+    private Data:      string
+    private AuthState: int
+    private Quit:      bool
+    private Upgrade:   bool
+    public  LastUid:   int          // uid of the last delivered message
+
+    public SmtpSession(store: MailStore, host: string) {
+        this.Store    = store
+        this.Users    = new Map<string, string>()
+        this.Host     = host
+        this.Mailbox  = "INBOX"
+        this.TlsActive = false
+        this.Authed    = false
+        this.AuthUser  = ""
+        this.HeloDone  = false
+        this.From      = ""
+        this.Rcpts     = new List<string>()
+        this.InData    = false
+        this.Data      = ""
+        this.AuthState = 0
+        this.Quit      = false
+        this.Upgrade   = false
+        this.LastUid   = 0
+    }
+
+    public void SetMailbox(string mb) { this.Mailbox = mb }
+    // Register an account: store the scrypt hash of `plaintext`, or a
+    // precomputed amalgame-auth/crypto hash via AddUserHash.
+    public void AddPassword(string name, string plaintext) { this.Users.Set(name, Password.Hash(plaintext)) }
+    public void AddUserHash(string name, string hash)      { this.Users.Set(name, hash) }
+    public bool IsQuit() { return this.Quit }
+    // STARTTLS was accepted; the transport must perform the TLS handshake
+    // then call SetTlsActive(true) (which also clears it).
+    public bool WantsTlsUpgrade() { return this.Upgrade }
+    public void SetTlsActive(bool on) {
+        this.TlsActive = on
+        this.Upgrade = false
+        // RFC 3207: after STARTTLS the client must re-issue EHLO; the
+        // session state (HELO, auth, envelope) is reset.
+        this.HeloDone = false
+        this.Authed = false
+        this.AuthUser = ""
+        this.From = ""
+        this.Rcpts = new List<string>()
+    }
+
+    public string Greeting() {
+        return "220 " + this.Host + " ESMTP Amalgame ready\r\n"
+    }
+
+    // Process one line (without trailing CRLF) and return the response to
+    // send (may be multi-line, already CRLF-terminated; "" while
+    // mid-DATA, where no per-line reply is sent).
+    public string Feed(string line) {
+        if (this.InData) { return this.feedData(line) }
+        if (this.AuthState != 0) { return this.feedAuth(line) }
+
+        let verb: string = SmtpSession.verbOf(line)
+        if (verb == "EHLO") { return this.onEhlo() }
+        if (verb == "HELO") { this.HeloDone = true; this.From = ""; this.Rcpts = new List<string>(); return "250 " + this.Host + "\r\n" }
+        if (verb == "STARTTLS") { return this.onStartTls() }
+        if (verb == "AUTH") { return this.onAuth(line) }
+        if (verb == "MAIL") { return this.onMail(line) }
+        if (verb == "RCPT") { return this.onRcpt(line) }
+        if (verb == "DATA") { return this.onData() }
+        if (verb == "RSET") { this.From = ""; this.Rcpts = new List<string>(); this.InData = false; this.Data = ""; return "250 2.0.0 Ok\r\n" }
+        if (verb == "NOOP") { return "250 2.0.0 Ok\r\n" }
+        if (verb == "VRFY") { return "252 2.1.5 Cannot VRFY; try RCPT\r\n" }
+        if (verb == "QUIT") { this.Quit = true; return "221 2.0.0 " + this.Host + " closing connection\r\n" }
+        return "500 5.5.2 Command unrecognized\r\n"
+    }
+
+    // ── command handlers ──────────────────────────────
+
+    private string onEhlo() {
+        this.HeloDone = true
+        this.From = ""
+        this.Rcpts = new List<string>()
+        // Build the multi-line 250 reply. Capabilities depend on TLS:
+        // advertise STARTTLS only before TLS; advertise AUTH only after.
+        let caps: List<string> = new List<string>()
+        caps.Add(this.Host)
+        caps.Add("PIPELINING")
+        caps.Add("SIZE 52428800")
+        caps.Add("8BITMIME")
+        if (!this.TlsActive) { caps.Add("STARTTLS") }
+        if (this.TlsActive)  { caps.Add("AUTH PLAIN LOGIN") }
+        let n: int = caps.Count()
+        var out: string = ""
+        for i in 0..n {
+            let last: bool = (i == n - 1)
+            if (last) { out = out + "250 " + caps.Get(i) + "\r\n" }
+            else      { out = out + "250-" + caps.Get(i) + "\r\n" }
+        }
+        return out
+    }
+
+    private string onStartTls() {
+        if (this.TlsActive) { return "503 5.5.1 Already running TLS\r\n" }
+        this.Upgrade = true
+        return "220 2.0.0 Ready to start TLS\r\n"
+    }
+
+    private string onMail(string line) {
+        if (!this.HeloDone) { return "503 5.5.1 Send HELO/EHLO first\r\n" }
+        let addr: string = SmtpSession.extractAddr(line)
+        this.From = addr
+        this.Rcpts = new List<string>()
+        return "250 2.1.0 Ok\r\n"
+    }
+
+    private string onRcpt(string line) {
+        if (String_Length(this.From) == 0 && this.Rcpts.Count() == 0 && !this.HeloDone) {
+            return "503 5.5.1 Send HELO/EHLO first\r\n"
+        }
+        if (String_Length(this.From) == 0) { return "503 5.5.1 Need MAIL before RCPT\r\n" }
+        let addr: string = SmtpSession.extractAddr(line)
+        if (String_Length(addr) == 0) { return "501 5.1.3 Bad recipient address\r\n" }
+        this.Rcpts.Add(addr)
+        return "250 2.1.5 Ok\r\n"
+    }
+
+    private string onData() {
+        if (this.Rcpts.Count() == 0) { return "503 5.5.1 Need RCPT before DATA\r\n" }
+        this.InData = true
+        this.Data = ""
+        return "354 End data with <CR><LF>.<CR><LF>\r\n"
+    }
+
+    // Accumulate DATA lines until a lone ".". Apply dot-unstuffing
+    // (RFC 5321 §4.5.2: a line starting with "." had a dot prepended).
+    private string feedData(string line) {
+        if (line == ".") {
+            this.InData = false
+            let uid: int = this.Store.Deliver(this.Mailbox, this.Data)
+            this.From = ""
+            this.Rcpts = new List<string>()
+            this.Data = ""
+            if (uid > 0) {
+                this.LastUid = uid
+                return "250 2.0.0 Ok: queued as " + String_FromInt(uid) + "\r\n"
+            }
+            return "451 4.3.0 Delivery failed: " + this.Store.LastError() + "\r\n"
+        }
+        var l: string = line
+        if (String_Length(l) > 0) {
+            let c0: string = String_CharAt1(l, 0)
+            if (c0 == ".") { l = String_Substring(l, 1, String_Length(l) - 1) }
+        }
+        this.Data = this.Data + l + "\r\n"
+        return ""
+    }
+
+    // ── AUTH ──────────────────────────────────────────
+
+    private string onAuth(string line) {
+        if (!this.TlsActive) { return "538 5.7.11 Encryption required for AUTH\r\n" }
+        if (this.Authed) { return "503 5.5.1 Already authenticated\r\n" }
+        // "AUTH PLAIN [initial]" | "AUTH LOGIN [initial]"
+        let rest: string = SmtpSession.afterFirstSpace(line)
+        let mech: string = String_ToUpper(SmtpSession.verbOf(rest))
+        if (mech == "PLAIN") {
+            let initial: string = SmtpSession.afterFirstSpace(rest)
+            if (String_Length(initial) > 0) { return this.verifyPlain(initial) }
+            this.AuthState = 1
+            return "334 \r\n"
+        }
+        if (mech == "LOGIN") {
+            this.AuthState = 2
+            return "334 VXNlcm5hbWU6\r\n"          // base64("Username:")
+        }
+        return "504 5.5.4 Unrecognized authentication mechanism\r\n"
+    }
+
+    private string feedAuth(string line) {
+        if (this.AuthState == 1) { this.AuthState = 0; return this.verifyPlain(line) }
+        if (this.AuthState == 2) {
+            this.AuthUser = SmtpSession.b64ToStr(line)
+            this.AuthState = 3
+            return "334 UGFzc3dvcmQ6\r\n"          // base64("Password:")
+        }
+        // AuthState == 3 → password
+        this.AuthState = 0
+        let pass: string = SmtpSession.b64ToStr(line)
+        return this.finishAuth(this.AuthUser, pass)
+    }
+
+    // AUTH PLAIN payload: base64 of "authzid\0authcid\0passwd". The NUL
+    // separators mean we must work at the byte level (a C string would
+    // truncate at the first NUL).
+    private string verifyPlain(string b64) {
+        let bytes: List<int> = SmtpSession.b64Bytes(b64)
+        let n: int = bytes.Count()
+        // find the two NUL separators
+        var first: int = -1
+        var second: int = -1
+        for i in 0..n {
+            let b: int = bytes.Get(i)
+            if (b == 0) {
+                if (first < 0) { first = i }
+                else if (second < 0) { second = i }
+            }
+        }
+        if (first < 0 || second < 0) { return "535 5.7.8 Authentication failed\r\n" }
+        let user: string = SmtpSession.bytesRangeToStr(bytes, first + 1, second)
+        let pass: string = SmtpSession.bytesRangeToStr(bytes, second + 1, n)
+        return this.finishAuth(user, pass)
+    }
+
+    private string finishAuth(string user, string pass) {
+        if (this.Users.Has(user) && Password.Verify(pass, this.Users.Get(user))) {
+            this.Authed = true
+            this.AuthUser = user
+            return "235 2.7.0 Authentication successful\r\n"
+        }
+        this.Authed = false
+        this.AuthUser = ""
+        return "535 5.7.8 Authentication failed\r\n"
+    }
+
+    // ── parsing helpers ───────────────────────────────
+
+    // First token, uppercased (the command verb).
+    private static string verbOf(string line) {
+        let sp: int = String_IndexOf(line, " ")
+        var w: string = line
+        if (sp >= 0) { w = String_Substring(line, 0, sp) }
+        return String_ToUpper(String_Trim(w))
+    }
+    private static string afterFirstSpace(string line) {
+        let sp: int = String_IndexOf(line, " ")
+        if (sp < 0) { return "" }
+        return String_Trim(String_Substring(line, sp + 1, String_Length(line) - sp - 1))
+    }
+    // Pull the addr-spec from "MAIL FROM:<a@b>" / "RCPT TO:<a@b>" (or a
+    // bare address after the colon). "" if none.
+    private static string extractAddr(string line) {
+        let lt: int = String_IndexOf(line, "<")
+        if (lt >= 0) {
+            let gt: int = String_IndexOf(line, ">")
+            if (gt > lt) { return String_Substring(line, lt + 1, gt - lt - 1) }
+        }
+        let colon: int = String_IndexOf(line, ":")
+        if (colon >= 0) { return String_Trim(String_Substring(line, colon + 1, String_Length(line) - colon - 1)) }
+        return ""
+    }
+
+    // ── base64 (inline; no dependency) ────────────────
+
+    private static List<int> b64Bytes(string s) {
+        let alpha: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        let out: List<int> = new List<int>()
+        var acc: int = 0
+        var nbits: int = 0
+        let n: int = String_Length(s)
+        for i in 0..n {
+            let c: string = String_CharAt1(s, i)
+            let v: int = String_IndexOf(alpha, c)
+            if (v < 0) { continue }
+            acc = (acc * 64) + v
+            nbits = nbits + 6
+            if (nbits >= 8) {
+                nbits = nbits - 8
+                let shift: int = SmtpSession.pow2(nbits)
+                let b: int = (acc / shift) & 255
+                out.Add(b)
+                acc = acc & (shift - 1)
+            }
+        }
+        return out
+    }
+    private static string b64ToStr(string s) {
+        return SmtpSession.bytesRangeToStr(SmtpSession.b64Bytes(s), 0, -1)
+    }
+    // Bytes [from, to) → string (to < 0 means "to end").
+    private static string bytesRangeToStr(List<int> bytes, int from, int to) {
+        let n: int = bytes.Count()
+        var end: int = to
+        if (end < 0 || end > n) { end = n }
+        var out: string = ""
+        var i: int = from
+        while (i < end) {
+            out = out + String_FromByte(bytes.Get(i))
+            i = i + 1
+        }
+        return out
+    }
+    private static int pow2(int e) {
+        var r: int = 1
+        for i in 0..e { r = r * 2 }
+        return r
+    }
+}
+
+// ── Transport: TcpServer accept loop + STARTTLS ───────────
+//
+// SmtpServer drives one SmtpSession per accepted connection. The
+// plaintext phase reads/writes the raw fd (recv/send); on an accepted
+// STARTTLS it wraps the fd in an amalgame-tls server TlsStream, hands
+// the handshake, and continues the dialogue over TLS. v0.1 serves one
+// connection at a time (no worker pool yet).
+public class SmtpServer {
+    public  Store:   MailStore
+    public  Users:   Map<string, string>
+    public  Host:    string
+    private Cert:    string
+    private Key:     string
+    private HasCert: bool
+
+    public SmtpServer(store: MailStore, host: string) {
+        this.Store   = store
+        this.Users   = new Map<string, string>()
+        this.Host    = host
+        this.Cert    = ""
+        this.Key     = ""
+        this.HasCert = false
+    }
+
+    public void AddPassword(string name, string plaintext) { this.Users.Set(name, Password.Hash(plaintext)) }
+    public void AddUserHash(string name, string hash)      { this.Users.Set(name, hash) }
+    // PEM cert + key enabling STARTTLS (and thus AUTH).
+    public SmtpServer WithCert(string certPath, string keyPath) {
+        this.Cert = certPath; this.Key = keyPath; this.HasCert = true; return this
+    }
+
+    // Blocking accept loop on `port`. One connection at a time.
+    public void Serve(int port) {
+        let srv = TcpServer_Listen(port, 64)
+        while (TcpServer_IsListening(srv)) {
+            let conn = TcpServer_Accept(srv)
+            if (TcpConn_IsConnected(conn)) {
+                var fd: int = -1
+                @c { fd = ((AmalgameTcpConn*) conn)->_fd; }
+                this.handle(fd)
+            }
+        }
+        TcpServer_Close(srv)
+    }
+
+    // One connection, identified by its socket fd.
+    private void handle(int fd) {
+        let sess: SmtpSession = new SmtpSession(this.Store, this.Host)
+        let keys: List<string> = this.Users.Keys()
+        let nk: int = keys.Count()
+        for i in 0..nk {
+            let k: string = keys.Get(i)
+            let v: string = this.Users.Get(k)
+            sess.AddUserHash(k, v)
+        }
+
+        SmtpServer.sendFd(fd, sess.Greeting())
+
+        // ── plaintext phase ──
+        var buf: string = ""
+        var phase: int = 0                       // 0 run, 1 done, 2 upgrade
+        while (phase == 0) {
+            let nl: int = String_IndexOf(buf, "\n")
+            if (nl < 0) {
+                let chunk: string = SmtpServer.recvFd(fd, 4096)
+                if (String_Length(chunk) == 0) { phase = 1 }
+                else { buf = buf + chunk }
+            } else {
+                let line: string = SmtpServer.lineAt(buf, nl)
+                buf = String_Substring(buf, nl + 1, String_Length(buf) - nl - 1)
+                let resp: string = sess.Feed(line)
+                if (String_Length(resp) > 0) { SmtpServer.sendFd(fd, resp) }
+                if (sess.IsQuit()) { phase = 1 }
+                else if (sess.WantsTlsUpgrade()) { phase = 2 }
+            }
+        }
+
+        if (phase == 2) {
+            if (!this.HasCert) { SmtpServer.sendFd(fd, "454 4.7.0 TLS not available\r\n") }
+            else {
+                let cfg0: TlsConfig = TlsConfig.Default()
+                let cfg:  TlsConfig = TlsConfig.WithCertFile(cfg0, this.Cert, this.Key)
+                let ctx:  TlsContext = TlsContext.Server(cfg)
+                let tls:  TlsStream = TlsStream.Wrap(fd, ctx, true)
+                let hs:   bool = TlsStream.Handshake(tls)
+                if (hs) {
+                    sess.SetTlsActive(true)
+                    var tbuf: string = ""
+                    var done: bool = false
+                    while (!done) {
+                        let nl: int = String_IndexOf(tbuf, "\n")
+                        if (nl < 0) {
+                            let chunk: string = SmtpServer.recvTls(tls, 4096)
+                            if (String_Length(chunk) == 0) { done = true }
+                            else { tbuf = tbuf + chunk }
+                        } else {
+                            let line: string = SmtpServer.lineAt(tbuf, nl)
+                            tbuf = String_Substring(tbuf, nl + 1, String_Length(tbuf) - nl - 1)
+                            let resp: string = sess.Feed(line)
+                            if (String_Length(resp) > 0) { SmtpServer.sendTls(tls, resp) }
+                            if (sess.IsQuit()) { done = true }
+                        }
+                    }
+                }
+                TlsStream.Close(tls)
+            }
+        }
+        @c { close((int) fd); }
+    }
+
+    // ── transport helpers ─────────────────────────────
+
+    private static string lineAt(string buf, int nl) {
+        var line: string = String_Substring(buf, 0, nl)
+        let ll: int = String_Length(line)
+        if (ll > 0) {
+            let last: string = String_CharAt1(line, ll - 1)
+            if (last == "\r") { line = String_Substring(line, 0, ll - 1) }
+        }
+        return line
+    }
+    private static string recvFd(int fd, int max) {
+        var r: string = ""
+        @c {
+            char* b = (char*) GC_MALLOC((size_t) max + 1);
+            long n = (long) recv((int) fd, b, (size_t) max, 0);
+            if (n > 0) { b[n] = 0; r = (code_string) b; }
+        }
+        return r
+    }
+    private static bool sendFd(int fd, string data) {
+        var ok: bool = false
+        @c { long n = (long) send((int) fd, data, strlen(data), 0); ok = (n >= 0); }
+        return ok
+    }
+    private static string recvTls(tls: TlsStream, max: int) {
+        var r: string = ""
+        @c {
+            char* b = (char*) GC_MALLOC((size_t) max + 1);
+            i64 n = Amalgame_Tls_TlsStream_ReadBytes((AmalgameTlsStream*) tls, b, (i64) max);
+            if (n > 0) { b[n] = 0; r = (code_string) b; }
+        }
+        return r
+    }
+    private static bool sendTls(tls: TlsStream, data: string) {
+        var ok: bool = false
+        @c {
+            i64 n = Amalgame_Tls_TlsStream_WriteBytes((AmalgameTlsStream*) tls, data, (i64) strlen(data));
+            ok = (n >= 0);
+        }
+        return ok
+    }
+}

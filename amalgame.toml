@@ -1,0 +1,43 @@
+# Package manifest — amalgame-net-smtp-server
+#
+# Receiving SMTP server (ESMTP) for the native Amalgame mail server —
+# Phase 3. A dedicated package so the existing client `amalgame-net-smtp`
+# (used by Mosaic contact forms) stays lean.
+#
+# Two layers: SmtpSession (the ESMTP command state machine — pure logic,
+# socket/TLS-free, unit-testable) and SmtpServer (the TcpServer accept
+# loop + STARTTLS upgrade via amalgame-tls — integration). Receive-only:
+# accepts mail and stores it locally via amalgame-net-mail-store; never
+# forwards, so not an open relay. AUTH (PLAIN/LOGIN) against scrypt
+# hashes via amalgame-crypto Password.Verify; TLS required before AUTH.
+#
+# See Amalgame/docs/proposals/native-mail-server.md.
+#
+# Installation:
+#
+#   amc package add net-smtp-server
+#   amc package add github.com/amalgame-lang/amalgame-net-smtp-server@v0.1.0
+
+[package]
+name              = "amalgame-net-smtp-server"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "Receiving ESMTP server for the native Amalgame mail server: SmtpSession state machine (EHLO/MAIL/RCPT/DATA/AUTH/STARTTLS) + SmtpServer TCP/TLS loop, delivering into amalgame-net-mail-store. Receive-only (not a relay)."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.8.72"
+schema-version    = 1
+
+# Auth verifies against scrypt hashes via amalgame-crypto Password.Verify
+# — the same hashes amalgame-auth stores (one unified account) — without
+# dragging in amalgame-auth's HTTP-coupled wrappers (net-http/async).
+[dependencies]
+amalgame-net-mail-store = ">=0.1.0"
+amalgame-crypto         = ">=0.6.0"
+amalgame-tls            = ">=0.3.5"
+
+[stdlib]
+classes   = ["SmtpSession", "SmtpServer"]
+header    = "facade-stub.h"
+namespace = "Amalgame.Net.SmtpServer"
+facade    = "facade.am"
+libs      = []
