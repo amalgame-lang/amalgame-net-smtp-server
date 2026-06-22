@@ -1,0 +1,25 @@
+// Smoke-test fixture: a real receiving SMTP server on 127.0.0.1:2526,
+// delivering into a temp MailStore, with STARTTLS (self-signed cert) and
+// one AUTH account (alice/s3cret). Driven by tests/smoke_test.sh, which
+// connects a real Python smtplib client (EHLO → STARTTLS → AUTH → send)
+// and asserts the message landed in the store. Blocks in Serve().
+
+namespace Smoke
+
+import Amalgame.Collections
+import Amalgame.Database.SQLite
+import Amalgame.Tls
+import Amalgame.Net.Mail
+import Amalgame.Net.SmtpServer
+
+public class Program {
+    public static void Main(string[] args) {
+        let base: string = "/tmp/amalgame-smtp-smoke"
+        let store: MailStore = MailStore.Open(base + "/store")
+        let srv: SmtpServer = new SmtpServer(store, "mail.test")
+        srv.AddPassword("alice", "s3cret")
+        let srv2: SmtpServer = srv.WithCert(base + "/cert.pem", base + "/key.pem")
+        Console.WriteLine("SMOKE-SERVER-READY")
+        srv2.Serve(2526)
+    }
+}

@@ -1,0 +1,115 @@
+// Test suite for amalgame-net-smtp-server — the SmtpSession state
+// machine, driven with strings against a real local MailStore +
+// Credentials (no socket, no TLS). Base64 AUTH tokens are precomputed
+// constants so the test needs no encoder.
+//
+// Style note: pull each method result into a typed local before calling
+// another method on it (--external mode lowering).
+
+namespace Tests
+
+import Amalgame.Collections
+import Amalgame.IO.Filesystem
+import Amalgame.Database.SQLite
+import Amalgame.Tls
+import Amalgame.Net.Mail
+import Amalgame.Net.SmtpServer
+
+public class Program {
+    public static void Main(string[] args) {
+        let root: string = "/tmp/amalgame-smtp-test"
+        Filesystem.Remove(root)                        // clean slate
+        let store: MailStore = MailStore.Open(root)
+
+        let s: SmtpSession = new SmtpSession(store, "mail.test")
+        s.AddPassword("alice", "s3cret")
+
+        // ── 1. greeting ──────────────────────────────────
+        let greet: string = s.Greeting()
+        if (String_Contains(greet, "220") && String_Contains(greet, "mail.test")) {
+            Console.WriteLine("[PASS] greeting")
+        } else { Console.WriteLine("[FAIL] greeting: " + greet) }
+
+        // ── 2. EHLO advertises STARTTLS (pre-TLS), not AUTH ──
+        let ehlo1: string = s.Feed("EHLO client.example")
+        if (String_Contains(ehlo1, "250") && String_Contains(ehlo1, "STARTTLS")
+            && !String_Contains(ehlo1, "AUTH")) {
+            Console.WriteLine("[PASS] ehlo pre-tls caps")
+        } else { Console.WriteLine("[FAIL] ehlo pre-tls caps: " + ehlo1) }
+
+        // ── 3. AUTH refused before TLS ───────────────────
+        let authNoTls: string = s.Feed("AUTH LOGIN")
+        if (String_Contains(authNoTls, "538")) { Console.WriteLine("[PASS] auth refused pre-tls") }
+        else { Console.WriteLine("[FAIL] auth refused pre-tls: " + authNoTls) }
+
+        // ── 4. STARTTLS signal ───────────────────────────
+        let st: string = s.Feed("STARTTLS")
+        let wants: bool = s.WantsTlsUpgrade()
+        if (String_Contains(st, "220") && wants) { Console.WriteLine("[PASS] starttls signal") }
+        else { Console.WriteLine("[FAIL] starttls signal: " + st) }
+        s.SetTlsActive(true)
+
+        // ── 5. EHLO after TLS advertises AUTH, not STARTTLS ──
+        let ehlo2: string = s.Feed("EHLO client.example")
+        if (String_Contains(ehlo2, "AUTH") && !String_Contains(ehlo2, "STARTTLS")) {
+            Console.WriteLine("[PASS] ehlo post-tls caps")
+        } else { Console.WriteLine("[FAIL] ehlo post-tls caps: " + ehlo2) }
+
+        // ── 6. AUTH LOGIN success (alice / s3cret) ───────
+        let a1: string = s.Feed("AUTH LOGIN")            // → 334 Username:
+        let a2: string = s.Feed("YWxpY2U=")              // base64("alice") → 334 Password:
+        let a3: string = s.Feed("czNjcmV0")              // base64("s3cret") → 235
+        let authed: bool = s.Authed
+        if (String_Contains(a1, "334") && String_Contains(a2, "334")
+            && String_Contains(a3, "235") && authed) {
+            Console.WriteLine("[PASS] auth login success")
+        } else { Console.WriteLine("[FAIL] auth login: " + a1 + "|" + a2 + "|" + a3) }
+
+        // ── 7. MAIL/RCPT/DATA delivery ───────────────────
+        let e3: string = s.Feed("EHLO client.example")   // re-EHLO post-auth
+        let m: string = s.Feed("MAIL FROM:<sender@example.com>")
+        let r: string = s.Feed("RCPT TO:<alice@mail.test>")
+        let d: string = s.Feed("DATA")
+        let b1: string = s.Feed("Subject: Hi")
+        let b2: string = s.Feed("")
+        let b3: string = s.Feed("Hello body")
+        let b4: string = s.Feed("..dotted line")         // dot-stuffed
+        let fin: string = s.Feed(".")
+        if (String_Contains(m, "250") && String_Contains(r, "250")
+            && String_Contains(d, "354") && String_Contains(fin, "250")) {
+            Console.WriteLine("[PASS] mail/rcpt/data dialogue")
+        } else { Console.WriteLine("[FAIL] dialogue: " + m + "|" + r + "|" + d + "|" + fin) }
+
+        // ── 8. message landed in the store, dot-unstuffed ──
+        let uid: int = s.LastUid
+        let body: string = store.Read("INBOX", uid)
+        if (uid > 0 && String_Contains(body, "Hello body")
+            && String_Contains(body, ".dotted line")
+            && !String_Contains(body, "..dotted line")) {
+            Console.WriteLine("[PASS] delivered + dot-unstuffed")
+        } else { Console.WriteLine("[FAIL] delivered: uid=" + String_FromInt(uid) + " body=" + body) }
+
+        // ── 9. AUTH LOGIN failure (wrong password) ───────
+        let s2: SmtpSession = new SmtpSession(store, "mail.test")
+        s2.AddPassword("alice", "s3cret")
+        s2.SetTlsActive(true)
+        let f1: string = s2.Feed("AUTH LOGIN")
+        let f2: string = s2.Feed("YWxpY2U=")             // alice
+        let f3: string = s2.Feed("d3Jvbmc=")             // base64("wrong")
+        let notAuthed: bool = s2.Authed
+        if (String_Contains(f3, "535") && !notAuthed) { Console.WriteLine("[PASS] auth login failure") }
+        else { Console.WriteLine("[FAIL] auth login failure: " + f3) }
+
+        // ── 10. QUIT ─────────────────────────────────────
+        let q: string = s.Feed("QUIT")
+        let isq: bool = s.IsQuit()
+        if (String_Contains(q, "221") && isq) { Console.WriteLine("[PASS] quit") }
+        else { Console.WriteLine("[FAIL] quit: " + q) }
+
+        // ── 11. unknown command ──────────────────────────
+        let s3: SmtpSession = new SmtpSession(store, "mail.test")
+        let unk: string = s3.Feed("FROBNICATE x")
+        if (String_Contains(unk, "500")) { Console.WriteLine("[PASS] unknown command") }
+        else { Console.WriteLine("[FAIL] unknown command: " + unk) }
+    }
+}
