@@ -119,6 +119,8 @@ check "[PASS] anti-spoof own domain"
 check "[PASS] auth lockout"
 check "[PASS] size cap"
 check "[PASS] dnsbl"
+check "[PASS] submission relay"
+check "[PASS] no-relay external rejected"
 echo "$OUT" | grep -q "\[FAIL\]" && FAIL=$((FAIL+1))
 echo "────────────────────────────────────────────"
 echo -e "  ${GREEN}PASS: $PASS${NC}  |  ${RED}FAIL: $FAIL${NC}"
