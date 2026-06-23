@@ -109,6 +109,12 @@ public class MailRelay {
     public Fn: Closure<RelayMsg, bool>
     public MailRelay(Closure<RelayMsg, bool> fn) { this.Fn = fn }
 }
+// Per-user store routing : maps a local-part to ITS own MailStore so inbound
+// mail is delivered to each recipient's own mailbox. Null = shared store.
+public class StoreResolver {
+    public Fn: Closure<string, MailStore>
+    public StoreResolver(Closure<string, MailStore> fn) { this.Fn = fn }
+}
 
 public class SmtpSession {
     public  Store:    MailStore
@@ -140,6 +146,7 @@ public class SmtpSession {
     private MaxRcpts:    int        // max recipients per transaction
     private MaxAuthFails: int       // lock AUTH after this many failures
     private Relay:        MailRelay // submission relay (null = receive-only)
+    public  Resolver:     StoreResolver // per-user store routing (null = shared)
 
     public SmtpSession(store: MailStore, host: string) {
         this.Store    = store
@@ -167,6 +174,7 @@ public class SmtpSession {
         this.MaxRcpts     = 100
         this.MaxAuthFails = 5
         this.Relay        = null
+        this.Resolver     = null
     }
 
     public void SetMailbox(string mb) { this.Mailbox = mb }
@@ -324,15 +332,16 @@ public class SmtpSession {
             // Partition recipients: local (this domain) → store ; external →
             // relay (submission). With NO local domain set, keep the legacy
             // behaviour: everything is local (stored), nothing relayed.
-            var hasLocal: bool = false
+            let locals: List<string> = new List<string>()
             let externals: List<string> = new List<string>()
             if (String_Length(this.LocalDomain) == 0) {
-                hasLocal = true
+                var ai: int = 0
+                while (ai < this.Rcpts.Count()) { locals.Add(this.Rcpts.Get(ai)); ai = ai + 1 }
             } else {
                 var ri: int = 0
                 while (ri < this.Rcpts.Count()) {
                     let r: string = this.Rcpts.Get(ri)
-                    if (SmtpSession.domainOf(r) == this.LocalDomain) { hasLocal = true }
+                    if (SmtpSession.domainOf(r) == this.LocalDomain) { locals.Add(r) }
                     else { externals.Add(r) }
                     ri = ri + 1
                 }
@@ -354,13 +363,30 @@ public class SmtpSession {
                     relayFailed = true
                 }
             }
+            // Local recipients : with a per-user store resolver, each gets the
+            // message in ITS OWN store (INBOX) ; without one, deliver once to the
+            // shared store/mailbox (legacy).
             var localUid: int = 0
-            if (hasLocal) { localUid = this.Store.Deliver(this.Mailbox, this.Data) }
+            var localFailed: bool = false
+            if (locals.Count() > 0) {
+                if (this.Resolver != null) {
+                    var li: int = 0
+                    while (li < locals.Count()) {
+                        let st: MailStore = this.Resolver.Fn(SmtpSession.localPartOf(locals.Get(li)))
+                        let u: int = st.Deliver("INBOX", this.Data)
+                        if (u > 0) { localUid = u } else { localFailed = true }
+                        li = li + 1
+                    }
+                } else {
+                    localUid = this.Store.Deliver(this.Mailbox, this.Data)
+                    if (localUid <= 0) { localFailed = true }
+                }
+            }
             this.Data = ""
             this.resetEnvelope()
             if (relayFailed) { return "551 5.7.1 Relay failed for one or more recipients\r\n" }
-            if (hasLocal && localUid <= 0) { return "451 4.3.0 Delivery failed: " + this.Store.LastError() + "\r\n" }
-            if (hasLocal) { this.LastUid = localUid; return "250 2.0.0 Ok: queued as " + String_FromInt(localUid) + "\r\n" }
+            if (locals.Count() > 0 && localFailed) { return "451 4.3.0 Delivery failed\r\n" }
+            if (locals.Count() > 0) { this.LastUid = localUid; return "250 2.0.0 Ok: queued as " + String_FromInt(localUid) + "\r\n" }
             return "250 2.0.0 Ok: relayed\r\n"
         }
         var l: string = line
@@ -485,6 +511,12 @@ public class SmtpSession {
         if (at < 0) { return "" }
         return String_ToLower(String_Substring(addr, at + 1, String_Length(addr) - at - 1))
     }
+    // Lowercased local part ("USER@domain" → "user"), for per-user routing.
+    private static string localPartOf(string addr) {
+        let at: int = String_IndexOf(addr, "@")
+        if (at < 0) { return String_ToLower(addr) }
+        return String_ToLower(String_Substring(addr, 0, at))
+    }
 
     // ── base64 (inline; no dependency) ────────────────
 
@@ -549,7 +581,8 @@ public class SmtpServer {
     private HasCert: bool
     private LocalDomain: string
     private DnsblZone: string
-    private Relay:     MailRelay   // submission relay (null = receive-only)
+    private Relay:     MailRelay     // submission relay (null = receive-only)
+    private Resolver:  StoreResolver // per-user store routing (null = shared)
 
     public SmtpServer(store: MailStore, host: string) {
         this.Store   = store
@@ -561,6 +594,7 @@ public class SmtpServer {
         this.LocalDomain = ""
         this.DnsblZone = ""
         this.Relay   = null
+        this.Resolver = null
     }
 
     public void AddPassword(string name, string plaintext) { this.Users.Set(name, Password.Hash(plaintext)) }
@@ -580,6 +614,9 @@ public class SmtpServer {
     // (e.g. wrapping amalgame-mail-send's Sender) instead of stored. No
     // mail-send dependency in this package — the consumer supplies the closure.
     public SmtpServer WithRelay(Closure<RelayMsg, bool> fn) { this.Relay = new MailRelay(fn); return this }
+    // Inject per-user store routing for inbound delivery: each local recipient's
+    // mail is delivered to the store returned by fn(local-part), not a shared one.
+    public SmtpServer WithStoreResolver(Closure<string, MailStore> fn) { this.Resolver = new StoreResolver(fn); return this }
 
     // Blocking accept loop on `port`. One connection at a time.
     public void Serve(int port) {
@@ -619,6 +656,7 @@ public class SmtpServer {
             sess.AddUserHash(k, v)
         }
         if (this.Relay != null) { sess.WithRelay(this.Relay.Fn) }
+        if (this.Resolver != null) { sess.Resolver = this.Resolver }
 
         // Anti-slowloris: a stalled recv() unblocks after the timeout
         // (recv returns 0 → we drop the connection). Critical for a
