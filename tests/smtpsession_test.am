@@ -111,5 +111,51 @@ public class Program {
         let unk: string = s3.Feed("FROBNICATE x")
         if (String_Contains(unk, "500")) { Console.WriteLine("[PASS] unknown command") }
         else { Console.WriteLine("[FAIL] unknown command: " + unk) }
+
+        // ── 12. anti-relay: unauth, non-local recipient rejected ──
+        let hr: SmtpSession = new SmtpSession(store, "mail.amalgame.me")
+        hr.WithLocalDomain("amalgame.me")
+        let hr0: string = hr.Feed("EHLO client")
+        let hrm: string = hr.Feed("MAIL FROM:<someone@external.com>")     // inbound from world → ok
+        let hrRelay: string = hr.Feed("RCPT TO:<victim@elsewhere.com>")   // non-local, unauth → denied
+        let hrLocal: string = hr.Feed("RCPT TO:<alice@amalgame.me>")      // local → ok
+        if (String_Contains(hrm, "250") && String_Contains(hrRelay, "550") && String_Contains(hrLocal, "250")) {
+            Console.WriteLine("[PASS] anti-relay")
+        } else { Console.WriteLine("[FAIL] anti-relay: m=" + hrm + " relay=" + hrRelay + " local=" + hrLocal) }
+
+        // ── 13. anti-spoof: unauth MAIL FROM in local domain rejected ──
+        let sp: SmtpSession = new SmtpSession(store, "mail.amalgame.me")
+        sp.WithLocalDomain("amalgame.me")
+        let sp0: string = sp.Feed("EHLO client")
+        let spr: string = sp.Feed("MAIL FROM:<alice@amalgame.me>")
+        if (String_Contains(spr, "550")) { Console.WriteLine("[PASS] anti-spoof own domain") }
+        else { Console.WriteLine("[FAIL] anti-spoof: " + spr) }
+
+        // ── 14. AUTH brute-force lockout ──────────────────
+        let lk: SmtpSession = new SmtpSession(store, "mail.amalgame.me")
+        lk.AddPassword("alice", "s3cret")
+        lk.SetTlsActive(true)
+        var fails: int = 0
+        for i in 0..5 {
+            let a: string = lk.Feed("AUTH LOGIN")
+            let u: string = lk.Feed("YWxpY2U=")        // alice
+            let p: string = lk.Feed("d3Jvbmc=")        // wrong
+            if (String_Contains(p, "535")) { fails = fails + 1 }
+        }
+        let locked: string = lk.Feed("AUTH LOGIN")     // 6th → locked
+        if (fails == 5 && String_Contains(locked, "454")) { Console.WriteLine("[PASS] auth lockout") }
+        else { Console.WriteLine("[FAIL] auth lockout: fails=" + String_FromInt(fails) + " locked=" + locked) }
+
+        // ── 15. SIZE cap ──────────────────────────────────
+        let sz: SmtpSession = new SmtpSession(store, "mail.test")
+        sz.WithMaxSize(40)
+        let z0: string = sz.Feed("EHLO client")
+        let zm: string = sz.Feed("MAIL FROM:<a@external.com>")
+        let zr: string = sz.Feed("RCPT TO:<u@mail.test>")
+        let zd: string = sz.Feed("DATA")
+        let zb: string = sz.Feed("this line is definitely longer than forty bytes total here")
+        let zf: string = sz.Feed(".")
+        if (String_Contains(zf, "552")) { Console.WriteLine("[PASS] size cap") }
+        else { Console.WriteLine("[FAIL] size cap: " + zf) }
     }
 }
