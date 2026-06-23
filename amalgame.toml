@@ -20,9 +20,9 @@
 
 [package]
 name              = "amalgame-net-smtp-server"
-version           = "0.2.2"
+version           = "0.3.0"
 license           = "Apache-2.0"
-description       = "Receiving ESMTP server for the native Amalgame mail server: SmtpSession state machine (EHLO/MAIL/RCPT/DATA/AUTH/STARTTLS) + SmtpServer TCP/TLS loop, delivering into amalgame-net-mail-store. Receive-only (not a relay)."
+description       = "Receiving ESMTP server for the native Amalgame mail server: SmtpSession state machine (EHLO/MAIL/RCPT/DATA/AUTH/STARTTLS) + SmtpServer TCP/TLS loop, delivering into amalgame-net-mail-store. Optional submission relay (WithRelay) for authed senders' external recipients; never an open relay."
 authors           = ["Bastien Mouget"]
 required-amalgame = ">=0.8.72"
 schema-version    = 1

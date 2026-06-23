@@ -5,9 +5,14 @@ A **receiving ESMTP server** for the native Amalgame mail server
 [`amalgame-net-smtp`](https://github.com/amalgame-lang/amalgame-net-smtp)
 (used by Mosaic contact forms) stays lean.
 
-Receive-only by design: it accepts mail and stores it locally via
-[`amalgame-net-mail-store`](https://github.com/amalgame-lang/amalgame-net-mail-store);
-it never forwards, so it is **not an open relay**. See
+Receive-first by design: it accepts mail and stores it locally via
+[`amalgame-net-mail-store`](https://github.com/amalgame-lang/amalgame-net-mail-store).
+**Optional submission relay** (`WithRelay`, v0.3.0): an *authenticated* sender's
+*external* recipients are forwarded through an injected closure (e.g. wrapping
+[`amalgame-mail-send`](https://github.com/amalgame-lang/amalgame-mail-send)'s
+`Sender`) — so this package keeps **no mail-send dependency**. Without a relay
+it stays receive-only. Unauthenticated external recipients are always refused,
+so it is **never an open relay**. See
 [`native-mail-server.md`](https://github.com/amalgame-lang/Amalgame/blob/main/docs/proposals/native-mail-server.md).
 
 ## Two layers
