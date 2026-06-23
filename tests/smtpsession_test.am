@@ -15,6 +15,16 @@ import Amalgame.Tls
 import Amalgame.Net.Mail
 import Amalgame.Net.SmtpServer
 
+// Records what the injected relay closure was asked to forward (the closure
+// captures an instance and mutates it, so the test can assert on it).
+public class RelayRec {
+    public Count:    int
+    public LastFrom: string
+    public LastTo:   string
+    public Ok:       bool
+    public RelayRec() { this.Count = 0; this.LastFrom = ""; this.LastTo = ""; this.Ok = true }
+}
+
 public class Program {
     public static void Main(string[] args) {
         let root: string = "/tmp/amalgame-smtp-test"
@@ -163,5 +173,51 @@ public class Program {
         let zf: string = sz.Feed(".")
         if (String_Contains(zf, "552")) { Console.WriteLine("[PASS] size cap") }
         else { Console.WriteLine("[FAIL] size cap: " + zf) }
+
+        // ── 16. submission relay: authed sender, external recipient → relayed ──
+        let rec: RelayRec = new RelayRec()
+        let rl: SmtpSession = new SmtpSession(store, "mail.amalgame.me")
+        rl.WithLocalDomain("amalgame.me")
+        rl.AddPassword("alice", "s3cret")
+        rl.SetTlsActive(true)
+        rl.WithRelay(msg => {
+            rec.Count = rec.Count + 1
+            rec.LastFrom = msg.From
+            rec.LastTo = msg.To
+            return rec.Ok
+        })
+        let rla: string = rl.Feed("AUTH LOGIN")
+        let rlu: string = rl.Feed("YWxpY2U=")            // alice
+        let rlp: string = rl.Feed("czNjcmV0")            // s3cret
+        let rle: string = rl.Feed("EHLO client")
+        let rlm: string = rl.Feed("MAIL FROM:<alice@amalgame.me>")
+        let rlr: string = rl.Feed("RCPT TO:<friend@gmail.com>")   // external, authed → accepted
+        let rld: string = rl.Feed("DATA")
+        let rlb: string = rl.Feed("Subject: hi")
+        let rlb2: string = rl.Feed("")
+        let rlb3: string = rl.Feed("hello friend")
+        let rlf: string = rl.Feed(".")
+        if (String_Contains(rlr, "250") && String_Contains(rlf, "relayed")
+            && rec.Count == 1 && rec.LastTo == "friend@gmail.com" && rec.LastFrom == "alice@amalgame.me") {
+            Console.WriteLine("[PASS] submission relay")
+        } else { Console.WriteLine("[FAIL] submission relay: r=" + rlr + " fin=" + rlf + " count=" + String_FromInt(rec.Count) + " to=" + rec.LastTo) }
+
+        // ── 17. authed external recipient but NO relay configured → 551 ──
+        let nr: SmtpSession = new SmtpSession(store, "mail.amalgame.me")
+        nr.WithLocalDomain("amalgame.me")
+        nr.AddPassword("alice", "s3cret")
+        nr.SetTlsActive(true)
+        let nra: string = nr.Feed("AUTH LOGIN")
+        let nru: string = nr.Feed("YWxpY2U=")
+        let nrp: string = nr.Feed("czNjcmV0")
+        let nre: string = nr.Feed("EHLO client")
+        let nrm: string = nr.Feed("MAIL FROM:<alice@amalgame.me>")
+        let nrr: string = nr.Feed("RCPT TO:<friend@gmail.com>")
+        let nrd: string = nr.Feed("DATA")
+        let nrb: string = nr.Feed("body")
+        let nrf: string = nr.Feed(".")
+        if (String_Contains(nrr, "250") && String_Contains(nrf, "551")) {
+            Console.WriteLine("[PASS] no-relay external rejected")
+        } else { Console.WriteLine("[FAIL] no-relay external: r=" + nrr + " fin=" + nrf) }
     }
 }
