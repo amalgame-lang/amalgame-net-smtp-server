@@ -10,6 +10,7 @@ import Amalgame.Tls
 @c {
     #include <string.h>
     #include <sys/socket.h>
+    #include <sys/time.h>
     #include <unistd.h>
 }
 
@@ -488,20 +489,31 @@ public class SmtpServer {
             sess.AddUserHash(k, v)
         }
 
+        // Anti-slowloris: a stalled recv() unblocks after the timeout
+        // (recv returns 0 → we drop the connection). Critical for a
+        // one-connection-at-a-time server.
+        SmtpServer.setRecvTimeout(fd, 30)
         SmtpServer.sendFd(fd, sess.Greeting())
 
         // ── plaintext phase ──
+        // CRLF-strict line framing (split on "\r\n" only): a bare LF is
+        // never treated as a line/end-of-DATA terminator → blocks SMTP
+        // smuggling. A line that grows past the cap with no CRLF aborts
+        // the connection (anti-memory-DoS).
         var buf: string = ""
         var phase: int = 0                       // 0 run, 1 done, 2 upgrade
         while (phase == 0) {
-            let nl: int = String_IndexOf(buf, "\n")
+            let nl: int = String_IndexOf(buf, "\r\n")
             if (nl < 0) {
-                let chunk: string = SmtpServer.recvFd(fd, 4096)
-                if (String_Length(chunk) == 0) { phase = 1 }
-                else { buf = buf + chunk }
+                if (String_Length(buf) > 65536) { SmtpServer.sendFd(fd, "500 5.5.2 Line too long\r\n"); phase = 1 }
+                else {
+                    let chunk: string = SmtpServer.recvFd(fd, 4096)
+                    if (String_Length(chunk) == 0) { phase = 1 }   // EOF or timeout
+                    else { buf = buf + chunk }
+                }
             } else {
-                let line: string = SmtpServer.lineAt(buf, nl)
-                buf = String_Substring(buf, nl + 1, String_Length(buf) - nl - 1)
+                let line: string = String_Substring(buf, 0, nl)
+                buf = String_Substring(buf, nl + 2, String_Length(buf) - nl - 2)
                 let resp: string = sess.Feed(line)
                 if (String_Length(resp) > 0) { SmtpServer.sendFd(fd, resp) }
                 if (sess.IsQuit()) { phase = 1 }
@@ -522,14 +534,17 @@ public class SmtpServer {
                     var tbuf: string = ""
                     var done: bool = false
                     while (!done) {
-                        let nl: int = String_IndexOf(tbuf, "\n")
+                        let nl: int = String_IndexOf(tbuf, "\r\n")
                         if (nl < 0) {
-                            let chunk: string = SmtpServer.recvTls(tls, 4096)
-                            if (String_Length(chunk) == 0) { done = true }
-                            else { tbuf = tbuf + chunk }
+                            if (String_Length(tbuf) > 65536) { SmtpServer.sendTls(tls, "500 5.5.2 Line too long\r\n"); done = true }
+                            else {
+                                let chunk: string = SmtpServer.recvTls(tls, 4096)
+                                if (String_Length(chunk) == 0) { done = true }
+                                else { tbuf = tbuf + chunk }
+                            }
                         } else {
-                            let line: string = SmtpServer.lineAt(tbuf, nl)
-                            tbuf = String_Substring(tbuf, nl + 1, String_Length(tbuf) - nl - 1)
+                            let line: string = String_Substring(tbuf, 0, nl)
+                            tbuf = String_Substring(tbuf, nl + 2, String_Length(tbuf) - nl - 2)
                             let resp: string = sess.Feed(line)
                             if (String_Length(resp) > 0) { SmtpServer.sendTls(tls, resp) }
                             if (sess.IsQuit()) { done = true }
@@ -544,14 +559,14 @@ public class SmtpServer {
 
     // ── transport helpers ─────────────────────────────
 
-    private static string lineAt(string buf, int nl) {
-        var line: string = String_Substring(buf, 0, nl)
-        let ll: int = String_Length(line)
-        if (ll > 0) {
-            let last: string = String_CharAt1(line, ll - 1)
-            if (last == "\r") { line = String_Substring(line, 0, ll - 1) }
+    // Set a receive timeout on the socket (anti-slowloris): a stalled
+    // recv() returns after `secs` instead of blocking forever.
+    private static void setRecvTimeout(int fd, int secs) {
+        @c {
+            struct timeval tv;
+            tv.tv_sec = (long) secs; tv.tv_usec = 0;
+            setsockopt((int) fd, SOL_SOCKET, SO_RCVTIMEO, (const void*) &tv, sizeof(tv));
         }
-        return line
     }
     private static string recvFd(int fd, int max) {
         var r: string = ""
