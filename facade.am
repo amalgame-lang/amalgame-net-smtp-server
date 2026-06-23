@@ -60,14 +60,25 @@ public class SmtpSession {
     public  AuthUser:  string
 
     private HeloDone:  bool
+    private MailGiven: bool         // a MAIL FROM was accepted (incl. null sender <>)
     private From:      string
     private Rcpts:     List<string>
     private InData:    bool
     private Data:      string
+    private DataSize:  int          // bytes accumulated in DATA (SIZE cap)
+    private Oversize:  bool         // DATA exceeded MaxSize → reject at end
     private AuthState: int
+    private AuthFails: int          // failed AUTH attempts (lockout)
     private Quit:      bool
     private Upgrade:   bool
     public  LastUid:   int          // uid of the last delivered message
+
+    // Hardening config (security-audit gate). Defaults are permissive
+    // for backward-compat; a production server MUST call WithLocalDomain.
+    private LocalDomain: string     // "" = accept any recipient (legacy)
+    private MaxSize:     int        // max message bytes
+    private MaxRcpts:    int        // max recipients per transaction
+    private MaxAuthFails: int       // lock AUTH after this many failures
 
     public SmtpSession(store: MailStore, host: string) {
         this.Store    = store
@@ -78,14 +89,22 @@ public class SmtpSession {
         this.Authed    = false
         this.AuthUser  = ""
         this.HeloDone  = false
+        this.MailGiven = false
         this.From      = ""
         this.Rcpts     = new List<string>()
         this.InData    = false
         this.Data      = ""
+        this.DataSize  = 0
+        this.Oversize  = false
         this.AuthState = 0
+        this.AuthFails = 0
         this.Quit      = false
         this.Upgrade   = false
         this.LastUid   = 0
+        this.LocalDomain  = ""
+        this.MaxSize      = 52428800   // 50 MiB
+        this.MaxRcpts     = 100
+        this.MaxAuthFails = 5
     }
 
     public void SetMailbox(string mb) { this.Mailbox = mb }
@@ -93,6 +112,14 @@ public class SmtpSession {
     // precomputed amalgame-auth/crypto hash via AddUserHash.
     public void AddPassword(string name, string plaintext) { this.Users.Set(name, Password.Hash(plaintext)) }
     public void AddUserHash(string name, string hash)      { this.Users.Set(name, hash) }
+    // ── hardening config ──
+    // Local domain this server is the MX for. With it set, unauthenticated
+    // senders may ONLY deliver to <user>@<domain> (anti-open-relay), and a
+    // MAIL FROM in this domain from an unauthenticated client is rejected
+    // (anti-spoofing of your own users).
+    public SmtpSession WithLocalDomain(string domain)  { this.LocalDomain = String_ToLower(domain); return this }
+    public SmtpSession WithMaxSize(int bytes)          { this.MaxSize = bytes; return this }
+    public SmtpSession WithMaxRecipients(int n)        { this.MaxRcpts = n; return this }
     public bool IsQuit() { return this.Quit }
     // STARTTLS was accepted; the transport must perform the TLS handshake
     // then call SetTlsActive(true) (which also clears it).
@@ -105,8 +132,11 @@ public class SmtpSession {
         this.HeloDone = false
         this.Authed = false
         this.AuthUser = ""
+        this.MailGiven = false
         this.From = ""
         this.Rcpts = new List<string>()
+        // AuthFails is intentionally NOT reset — a STARTTLS must not reset
+        // the brute-force lockout.
     }
 
     public string Greeting() {
@@ -146,7 +176,7 @@ public class SmtpSession {
         let caps: List<string> = new List<string>()
         caps.Add(this.Host)
         caps.Add("PIPELINING")
-        caps.Add("SIZE 52428800")
+        caps.Add("SIZE " + String_FromInt(this.MaxSize))
         caps.Add("8BITMIME")
         if (!this.TlsActive) { caps.Add("STARTTLS") }
         if (this.TlsActive)  { caps.Add("AUTH PLAIN LOGIN") }
@@ -168,19 +198,36 @@ public class SmtpSession {
 
     private string onMail(string line) {
         if (!this.HeloDone) { return "503 5.5.1 Send HELO/EHLO first\r\n" }
-        let addr: string = SmtpSession.extractAddr(line)
+        let addr: string = SmtpSession.extractAddr(line)   // "" = null sender <> (bounces)
+        // Anti-spoofing: an unauthenticated client must not claim to be one
+        // of our own users (MAIL FROM in the local domain).
+        if (!this.Authed && String_Length(this.LocalDomain) > 0 && String_Length(addr) > 0) {
+            let fd: string = SmtpSession.domainOf(addr)
+            if (fd == this.LocalDomain) {
+                return "550 5.7.1 Authentication required to send as " + this.LocalDomain + "\r\n"
+            }
+        }
         this.From = addr
+        this.MailGiven = true
         this.Rcpts = new List<string>()
         return "250 2.1.0 Ok\r\n"
     }
 
     private string onRcpt(string line) {
-        if (String_Length(this.From) == 0 && this.Rcpts.Count() == 0 && !this.HeloDone) {
-            return "503 5.5.1 Send HELO/EHLO first\r\n"
-        }
-        if (String_Length(this.From) == 0) { return "503 5.5.1 Need MAIL before RCPT\r\n" }
+        if (!this.HeloDone) { return "503 5.5.1 Send HELO/EHLO first\r\n" }
+        if (!this.MailGiven) { return "503 5.5.1 Need MAIL before RCPT\r\n" }
         let addr: string = SmtpSession.extractAddr(line)
         if (String_Length(addr) == 0) { return "501 5.1.3 Bad recipient address\r\n" }
+        if (this.Rcpts.Count() >= this.MaxRcpts) { return "452 4.5.3 Too many recipients\r\n" }
+        // Anti-open-relay / anti-backscatter: when a local domain is set,
+        // an unauthenticated sender may only deliver to a local recipient.
+        // Rejected HERE (during the transaction), never accepted-then-bounced.
+        if (!this.Authed && String_Length(this.LocalDomain) > 0) {
+            let rd: string = SmtpSession.domainOf(addr)
+            if (rd != this.LocalDomain) {
+                return "550 5.7.1 Relaying denied: " + addr + " is not local\r\n"
+            }
+        }
         this.Rcpts.Add(addr)
         return "250 2.1.5 Ok\r\n"
     }
@@ -189,17 +236,26 @@ public class SmtpSession {
         if (this.Rcpts.Count() == 0) { return "503 5.5.1 Need RCPT before DATA\r\n" }
         this.InData = true
         this.Data = ""
+        this.DataSize = 0
+        this.Oversize = false
         return "354 End data with <CR><LF>.<CR><LF>\r\n"
     }
 
     // Accumulate DATA lines until a lone ".". Apply dot-unstuffing
     // (RFC 5321 §4.5.2: a line starting with "." had a dot prepended).
+    // Enforces the SIZE cap (anti-DoS): once exceeded we stop buffering and
+    // reject the whole message at end-of-DATA.
     private string feedData(string line) {
         if (line == ".") {
             this.InData = false
-            let uid: int = this.Store.Deliver(this.Mailbox, this.Data)
             this.From = ""
+            this.MailGiven = false
             this.Rcpts = new List<string>()
+            if (this.Oversize) {
+                this.Data = ""
+                return "552 5.3.4 Message exceeds maximum size of " + String_FromInt(this.MaxSize) + " bytes\r\n"
+            }
+            let uid: int = this.Store.Deliver(this.Mailbox, this.Data)
             this.Data = ""
             if (uid > 0) {
                 this.LastUid = uid
@@ -212,7 +268,9 @@ public class SmtpSession {
             let c0: string = String_CharAt1(l, 0)
             if (c0 == ".") { l = String_Substring(l, 1, String_Length(l) - 1) }
         }
-        this.Data = this.Data + l + "\r\n"
+        this.DataSize = this.DataSize + String_Length(l) + 2
+        if (this.DataSize > this.MaxSize) { this.Oversize = true }
+        if (!this.Oversize) { this.Data = this.Data + l + "\r\n" }
         return ""
     }
 
@@ -221,6 +279,8 @@ public class SmtpSession {
     private string onAuth(string line) {
         if (!this.TlsActive) { return "538 5.7.11 Encryption required for AUTH\r\n" }
         if (this.Authed) { return "503 5.5.1 Already authenticated\r\n" }
+        // Brute-force lockout: refuse further AUTH after too many failures.
+        if (this.AuthFails >= this.MaxAuthFails) { return "454 4.7.0 Too many authentication failures\r\n" }
         // "AUTH PLAIN [initial]" | "AUTH LOGIN [initial]"
         let rest: string = SmtpSession.afterFirstSpace(line)
         let mech: string = String_ToUpper(SmtpSession.verbOf(rest))
@@ -276,10 +336,12 @@ public class SmtpSession {
         if (this.Users.Has(user) && Password.Verify(pass, this.Users.Get(user))) {
             this.Authed = true
             this.AuthUser = user
+            this.AuthFails = 0
             return "235 2.7.0 Authentication successful\r\n"
         }
         this.Authed = false
         this.AuthUser = ""
+        this.AuthFails = this.AuthFails + 1
         return "535 5.7.8 Authentication failed\r\n"
     }
 
@@ -308,6 +370,13 @@ public class SmtpSession {
         let colon: int = String_IndexOf(line, ":")
         if (colon >= 0) { return String_Trim(String_Substring(line, colon + 1, String_Length(line) - colon - 1)) }
         return ""
+    }
+
+    // Lowercased domain part of an addr-spec ("user@DOMAIN" → "domain").
+    private static string domainOf(string addr) {
+        let at: int = String_IndexOf(addr, "@")
+        if (at < 0) { return "" }
+        return String_ToLower(String_Substring(addr, at + 1, String_Length(addr) - at - 1))
     }
 
     // ── base64 (inline; no dependency) ────────────────
@@ -371,6 +440,7 @@ public class SmtpServer {
     private Cert:    string
     private Key:     string
     private HasCert: bool
+    private LocalDomain: string
 
     public SmtpServer(store: MailStore, host: string) {
         this.Store   = store
@@ -379,6 +449,7 @@ public class SmtpServer {
         this.Cert    = ""
         this.Key     = ""
         this.HasCert = false
+        this.LocalDomain = ""
     }
 
     public void AddPassword(string name, string plaintext) { this.Users.Set(name, Password.Hash(plaintext)) }
@@ -387,6 +458,9 @@ public class SmtpServer {
     public SmtpServer WithCert(string certPath, string keyPath) {
         this.Cert = certPath; this.Key = keyPath; this.HasCert = true; return this
     }
+    // The domain this server is MX for — enables anti-relay + anti-spoof
+    // (unauthenticated senders may only deliver to local recipients).
+    public SmtpServer WithLocalDomain(string domain) { this.LocalDomain = domain; return this }
 
     // Blocking accept loop on `port`. One connection at a time.
     public void Serve(int port) {
@@ -405,6 +479,7 @@ public class SmtpServer {
     // One connection, identified by its socket fd.
     private void handle(int fd) {
         let sess: SmtpSession = new SmtpSession(this.Store, this.Host)
+        if (String_Length(this.LocalDomain) > 0) { sess.WithLocalDomain(this.LocalDomain) }
         let keys: List<string> = this.Users.Keys()
         let nk: int = keys.Count()
         for i in 0..nk {

@@ -71,6 +71,26 @@ should not depend on. The scrypt hashes are identical, so the unified
 account is preserved. When `amalgame-auth` grows a protocol-neutral
 `Credentials` core (no net-http), this package can switch to it.
 
+
+## Security hardening (v0.2.0)
+
+Anti-abuse guards, enabled by `SmtpServer.WithLocalDomain("amalgame.me")`
+(or `SmtpSession.WithLocalDomain`):
+
+- **No open relay / no backscatter** — an unauthenticated sender may only
+  deliver to a *local* recipient (`<user>@amalgame.me`); any other RCPT is
+  refused `550` **during** the transaction (never accepted-then-bounced).
+  Authenticated users may relay anywhere.
+- **Anti-spoofing** — an unauthenticated `MAIL FROM:<…@amalgame.me>` (a
+  client pretending to be one of your own users) is refused `550`.
+- **AUTH brute-force lockout** — after 5 failed AUTH the session refuses
+  further attempts (`454`); a STARTTLS does not reset the counter.
+- **Resource limits** — `WithMaxSize(bytes)` (advertised SIZE, oversize →
+  `552`), `WithMaxRecipients(n)` (`452`). Null sender `<>` accepted (bounces).
+
+Still ahead (audit): per-IP rate-limit + connection caps + idle timeouts in
+the transport, inbound SPF/DKIM/DMARC verification, greylisting, DNSBL.
+
 ## Running the server
 
 ```amalgame
