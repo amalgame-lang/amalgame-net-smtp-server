@@ -112,6 +112,12 @@ public class Program {
         if (String_Contains(unk, "500")) { Console.WriteLine("[PASS] unknown command") }
         else { Console.WriteLine("[FAIL] unknown command: " + unk) }
 
+        // ── (sec) DNSBL listed / not-listed (Spamhaus test addrs) ──
+        let bl: bool = Dnsbl.Listed("127.0.0.2", "zen.spamhaus.org")
+        let nbl: bool = Dnsbl.Listed("127.0.0.1", "zen.spamhaus.org")
+        if (bl && !nbl) { Console.WriteLine("[PASS] dnsbl") }
+        else { Console.WriteLine("[FAIL] dnsbl (listed-test should be true, not-listed should be false)") }
+
         // ── 12. anti-relay: unauth, non-local recipient rejected ──
         let hr: SmtpSession = new SmtpSession(store, "mail.amalgame.me")
         hr.WithLocalDomain("amalgame.me")

@@ -97,7 +97,7 @@ cp "$SCRIPT_DIR/smtpsession_test.am" "$PKG_DIR/_test.am"
 ( cd "$PKG_DIR" && "$AMC" -o "$BUILD_DIR/test" _test.am $EXT --external facade.am ) 2>&1 | tail -15
 gcc -O2 $INC -Wno-incompatible-pointer-types "$BUILD_DIR/test.c" \
     "$BUILD_DIR/facade.o" "$BUILD_DIR/store.o" "$BUILD_DIR/iofs.o" "$BUILD_DIR/crypto.o" "$BUILD_DIR/sqlite3.o" \
-    -lgc -lm -lssl -lcrypto -lz -ldl -lpthread -o "$BUILD_DIR/test" 2>"$BUILD_DIR/gcc.log" \
+    -lgc -lm -lssl -lcrypto -lz -ldl -lresolv -lpthread -o "$BUILD_DIR/test" 2>"$BUILD_DIR/gcc.log" \
     || { echo -e "${RED}test link failed${NC}"; cat "$BUILD_DIR/gcc.log"; exit 1; }
 
 OUT="$("$BUILD_DIR/test" 2>&1)"; echo "$OUT"
@@ -118,6 +118,7 @@ check "[PASS] anti-relay"
 check "[PASS] anti-spoof own domain"
 check "[PASS] auth lockout"
 check "[PASS] size cap"
+check "[PASS] dnsbl"
 echo "$OUT" | grep -q "\[FAIL\]" && FAIL=$((FAIL+1))
 echo "────────────────────────────────────────────"
 echo -e "  ${GREEN}PASS: $PASS${NC}  |  ${RED}FAIL: $FAIL${NC}"
