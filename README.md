@@ -14,8 +14,8 @@ it never forwards, so it is **not an open relay**. See
 
 | Layer | Status |
 |---|---|
-| **`SmtpSession`** — the ESMTP command state machine (pure logic, socket/TLS-free, unit-tested 11/11) | ✅ v0.1.0 |
-| **`SmtpServer`** — the TcpServer accept loop + STARTTLS upgrade (transport, loopback smoke-tested) | ✅ v0.1.0 |
+| **`SmtpSession`** — the ESMTP command state machine + abuse guards (pure logic, socket/TLS-free, unit-tested 16/16) | ✅ v0.2.2 |
+| **`SmtpServer`** — the TcpServer accept loop + STARTTLS + DNSBL + transport hardening (loopback smoke-tested) | ✅ v0.2.2 |
 
 `SmtpSession` is the heart: you feed it one command line at a time and it
 returns the response to send, accumulates the DATA payload (with RFC 5321
@@ -72,9 +72,9 @@ account is preserved. When `amalgame-auth` grows a protocol-neutral
 `Credentials` core (no net-http), this package can switch to it.
 
 
-## Security hardening (v0.2.0)
+## Security hardening (v0.2.0 – v0.2.2)
 
-Anti-abuse guards, enabled by `SmtpServer.WithLocalDomain("amalgame.me")`
+**Session guards** (v0.2.0), enabled by `SmtpServer.WithLocalDomain("amalgame.me")`
 (or `SmtpSession.WithLocalDomain`):
 
 - **No open relay / no backscatter** — an unauthenticated sender may only
@@ -88,8 +88,23 @@ Anti-abuse guards, enabled by `SmtpServer.WithLocalDomain("amalgame.me")`
 - **Resource limits** — `WithMaxSize(bytes)` (advertised SIZE, oversize →
   `552`), `WithMaxRecipients(n)` (`452`). Null sender `<>` accepted (bounces).
 
-Still ahead (audit): per-IP rate-limit + connection caps + idle timeouts in
-the transport, inbound SPF/DKIM/DMARC verification, greylisting, DNSBL.
+**Transport** (v0.2.1):
+
+- **`SO_RCVTIMEO` recv timeout** (30 s) — anti-slowloris: a stalled client
+  no longer blocks the one-connection-at-a-time server.
+- **CRLF-strict line framing** — split on `\r\n` only; a bare LF never ends
+  a line or DATA → blocks **SMTP smuggling**.
+- **64 KiB per-line cap** — abort overlong lines (anti-memory-DoS).
+
+**Connection filtering** (v0.2.2):
+
+- **DNSBL** — `SmtpServer.WithDnsbl("zen.spamhaus.org")` rejects (`554`) a
+  connecting IP listed in the given blocklist, before any dialogue.
+  `Dnsbl.Listed(ip, zone)` is exposed too. (Link `-lresolv`.)
+
+Still ahead (audit): inbound SPF/DKIM/DMARC verification, greylisting,
+per-IP connection rate-limit + caps (once a worker pool exists), mailbox
+quotas, `postmaster@`/`abuse@`.
 
 ## Running the server
 
