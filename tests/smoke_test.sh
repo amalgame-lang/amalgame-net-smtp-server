@@ -80,7 +80,7 @@ cp "$SCRIPT_DIR/smoke_server.am" "$PKG_DIR/_smoke.am"
 ( cd "$PKG_DIR" && "$AMC" -o "$BUILD_DIR/smoke" _smoke.am $EXT --external facade.am ) >/dev/null 2>&1
 gcc -O2 $INC -Wno-incompatible-pointer-types "$BUILD_DIR/smoke.c" \
     "$BUILD_DIR/facade.o" "$BUILD_DIR/store.o" "$BUILD_DIR/iofs.o" "$BUILD_DIR/crypto.o" "$BUILD_DIR/sqlite3.o" \
-    -lgc -lm -lssl -lcrypto -lz -ldl -lpthread -o "$BUILD_DIR/smoke" 2>"$BUILD_DIR/g.log" \
+    -lgc -lm -lssl -lcrypto -lz -ldl -lresolv -lpthread -o "$BUILD_DIR/smoke" 2>"$BUILD_DIR/g.log" \
     || { echo -e "${RED}smoke link failed${NC}"; cat "$BUILD_DIR/g.log"; exit 1; }
 
 echo "── run server ──"

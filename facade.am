@@ -12,6 +12,49 @@ import Amalgame.Tls
     #include <sys/socket.h>
     #include <sys/time.h>
     #include <unistd.h>
+    #include <netinet/in.h>
+    #include <resolv.h>
+    #include <arpa/nameser.h>
+}
+
+// DNS blocklist (DNSBL/RBL) check. Listed(ip, zone) reverses an IPv4
+// address and queries <d.c.b.a>.<zone> — an A answer means the IP is
+// listed (e.g. zone "zen.spamhaus.org"). Used to reject spam-source IPs
+// at connect. Requires linking -lresolv.
+public class Dnsbl {
+    public static bool Listed(string ip, string zone) {
+        let rev: string = Dnsbl.reverseV4(ip)
+        if (String_Length(rev) == 0) { return false }
+        let name: string = rev + "." + zone
+        var listed: bool = false
+        @c {
+            unsigned char ans[2048];
+            int len = res_query((const char*) name, ns_c_in, ns_t_a, ans, sizeof(ans));
+            if (len >= 0) {
+                ns_msg h;
+                if (ns_initparse(ans, len, &h) >= 0 && ns_msg_count(h, ns_s_an) > 0) { listed = true; }
+            }
+        }
+        return listed
+    }
+    // "a.b.c.d" → "d.c.b.a"; "" if not a dotted IPv4.
+    private static string reverseV4(string ip) {
+        let parts: List<string> = Dnsbl.splitDot(ip)
+        if (parts.Count() != 4) { return "" }
+        return parts.Get(3) + "." + parts.Get(2) + "." + parts.Get(1) + "." + parts.Get(0)
+    }
+    private static List<string> splitDot(string s) {
+        let out: List<string> = new List<string>()
+        var rest: string = s
+        var idx: int = String_IndexOf(rest, ".")
+        while (idx >= 0) {
+            out.Add(String_Substring(rest, 0, idx))
+            rest = String_Substring(rest, idx + 1, String_Length(rest) - idx - 1)
+            idx = String_IndexOf(rest, ".")
+        }
+        out.Add(rest)
+        return out
+    }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -442,6 +485,7 @@ public class SmtpServer {
     private Key:     string
     private HasCert: bool
     private LocalDomain: string
+    private DnsblZone: string
 
     public SmtpServer(store: MailStore, host: string) {
         this.Store   = store
@@ -451,6 +495,7 @@ public class SmtpServer {
         this.Key     = ""
         this.HasCert = false
         this.LocalDomain = ""
+        this.DnsblZone = ""
     }
 
     public void AddPassword(string name, string plaintext) { this.Users.Set(name, Password.Hash(plaintext)) }
@@ -462,6 +507,9 @@ public class SmtpServer {
     // The domain this server is MX for — enables anti-relay + anti-spoof
     // (unauthenticated senders may only deliver to local recipients).
     public SmtpServer WithLocalDomain(string domain) { this.LocalDomain = domain; return this }
+    // Reject connecting IPs listed in this DNSBL zone (e.g.
+    // "zen.spamhaus.org"). "" = no DNSBL check.
+    public SmtpServer WithDnsbl(string zone) { this.DnsblZone = zone; return this }
 
     // Blocking accept loop on `port`. One connection at a time.
     public void Serve(int port) {
@@ -470,8 +518,20 @@ public class SmtpServer {
             let conn = TcpServer_Accept(srv)
             if (TcpConn_IsConnected(conn)) {
                 var fd: int = -1
-                @c { fd = ((AmalgameTcpConn*) conn)->_fd; }
-                this.handle(fd)
+                var ip: string = ""
+                @c {
+                    AmalgameTcpConn* cc = (AmalgameTcpConn*) conn;
+                    fd = cc->_fd;
+                    if (cc->RemoteIp) ip = (code_string) cc->RemoteIp;
+                }
+                // DNSBL: drop spam-source IPs before any dialogue.
+                if (String_Length(this.DnsblZone) > 0 && String_Length(ip) > 0
+                    && Dnsbl.Listed(ip, this.DnsblZone)) {
+                    SmtpServer.sendFd(fd, "554 5.7.1 " + ip + " blocked (listed in " + this.DnsblZone + ")\r\n")
+                    @c { close((int) fd); }
+                } else {
+                    this.handle(fd)
+                }
             }
         }
         TcpServer_Close(srv)
