@@ -549,6 +549,7 @@ public class SmtpServer {
     private HasCert: bool
     private LocalDomain: string
     private DnsblZone: string
+    private Relay:     MailRelay   // submission relay (null = receive-only)
 
     public SmtpServer(store: MailStore, host: string) {
         this.Store   = store
@@ -559,6 +560,7 @@ public class SmtpServer {
         this.HasCert = false
         this.LocalDomain = ""
         this.DnsblZone = ""
+        this.Relay   = null
     }
 
     public void AddPassword(string name, string plaintext) { this.Users.Set(name, Password.Hash(plaintext)) }
@@ -573,6 +575,11 @@ public class SmtpServer {
     // Reject connecting IPs listed in this DNSBL zone (e.g.
     // "zen.spamhaus.org"). "" = no DNSBL check.
     public SmtpServer WithDnsbl(string zone) { this.DnsblZone = zone; return this }
+    // Inject a submission relay (applied to every session). With it set, an
+    // AUTHENTICATED sender's EXTERNAL recipients are relayed via the closure
+    // (e.g. wrapping amalgame-mail-send's Sender) instead of stored. No
+    // mail-send dependency in this package — the consumer supplies the closure.
+    public SmtpServer WithRelay(Closure<RelayMsg, bool> fn) { this.Relay = new MailRelay(fn); return this }
 
     // Blocking accept loop on `port`. One connection at a time.
     public void Serve(int port) {
@@ -611,6 +618,7 @@ public class SmtpServer {
             let v: string = this.Users.Get(k)
             sess.AddUserHash(k, v)
         }
+        if (this.Relay != null) { sess.WithRelay(this.Relay.Fn) }
 
         // Anti-slowloris: a stalled recv() unblocks after the timeout
         // (recv returns 0 → we drop the connection). Critical for a
