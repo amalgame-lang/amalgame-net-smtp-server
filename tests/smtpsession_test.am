@@ -276,5 +276,36 @@ public class Program {
         if (String_Contains(acf, "250") && accUid > 0 && String_Contains(accBody, "hello friend ok")) {
             Console.WriteLine("[PASS] inbound filter accept → INBOX")
         } else { Console.WriteLine("[FAIL] inbound filter accept: fin=" + acf + " uid=" + String_FromInt(accUid)) }
+
+        // ── 21. submission save-to-Sent: authed sender's msg copied to "Sent" ──
+        let ss: SmtpSession = new SmtpSession(store, "mail.amalgame.me")
+        ss.WithLocalDomain("amalgame.me")
+        ss.AddPassword("alice", "s3cret")
+        ss.SetTlsActive(true)
+        ss.Resolver = new StoreResolver(u => store)   // tout login → ce store
+        ss.WithSaveToSent(true)
+        ss.WithRelay(msg => true)                     // accepte le relais externe
+        let sa1: string = ss.Feed("AUTH LOGIN")
+        let sa2: string = ss.Feed("YWxpY2U=")
+        let sa3: string = ss.Feed("czNjcmV0")
+        let se: string = ss.Feed("EHLO client")
+        let sm: string = ss.Feed("MAIL FROM:<alice@amalgame.me>")
+        let sr: string = ss.Feed("RCPT TO:<friend@gmail.com>")
+        let sd: string = ss.Feed("DATA")
+        let sb1: string = ss.Feed("Subject: hello sent")
+        let sb2: string = ss.Feed("")
+        let sb3: string = ss.Feed("body in sent folder")
+        let sf: string = ss.Feed(".")
+        let sentUids: List<int> = store.Uids("Sent")
+        var sentFound: bool = false
+        var sui: int = 0
+        while (sui < sentUids.Count()) {
+            let sbody: string = store.Read("Sent", sentUids.Get(sui))
+            if (String_Contains(sbody, "hello sent")) { sentFound = true }
+            sui = sui + 1
+        }
+        if (String_Contains(sf, "250") && sentFound) {
+            Console.WriteLine("[PASS] submission save-to-Sent")
+        } else { Console.WriteLine("[FAIL] submission save-to-Sent: fin=" + sf + " found=" + (sentFound ? "true" : "false")) }
     }
 }

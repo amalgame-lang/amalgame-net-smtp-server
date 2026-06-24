@@ -172,6 +172,7 @@ public class SmtpSession {
     public  Resolver:     StoreResolver // per-user store routing (null = shared)
     public  PeerIp:       string    // connecting client IP (set by transport, for SPF)
     private Filter:       InboundFilter // inbound anti-spam filter (null = none)
+    private SaveSent:     bool       // submission: copy authed sender's msg to "Sent"
 
     public SmtpSession(store: MailStore, host: string) {
         this.Store    = store
@@ -197,6 +198,7 @@ public class SmtpSession {
         this.LocalDomain  = ""
         this.PeerIp       = ""
         this.Filter       = null
+        this.SaveSent     = false
         this.MaxSize      = 52428800   // 50 MiB
         this.MaxRcpts     = 100
         this.MaxAuthFails = 5
@@ -227,6 +229,10 @@ public class SmtpSession {
     // Applied at end-of-DATA to LOCAL recipients; the closure returns a verdict
     // (accept/reject/defer/junk). Null = no filtering (legacy behaviour).
     public SmtpSession WithInboundFilter(Closure<InboundMsg, FilterVerdict> fn) { this.Filter = new InboundFilter(fn); return this }
+    // Submission: copy an authenticated sender's message into their own "Sent"
+    // mailbox at end-of-DATA (so clients without IMAP APPEND still see sent mail).
+    // Requires a store resolver. Off by default (legacy behaviour unchanged).
+    public SmtpSession WithSaveToSent(bool on) { this.SaveSent = on; return this }
     public bool IsQuit() { return this.Quit }
     // STARTTLS was accepted; the transport must perform the TLS handshake
     // then call SetTlsActive(true) (which also clears it).
@@ -432,6 +438,13 @@ public class SmtpSession {
                     localUid = this.Store.Deliver(legacyBox, this.Data)
                     if (localUid <= 0) { localFailed = true }
                 }
+            }
+            // Submission save-to-Sent: copy the authenticated sender's message
+            // into THEIR OWN "Sent" mailbox (once per message, best-effort) so
+            // every client — even without IMAP APPEND — sees its sent mail.
+            if (this.SaveSent && this.Authed && this.Resolver != null && String_Length(this.AuthUser) > 0) {
+                let sentStore: MailStore = this.Resolver.Fn(this.AuthUser)
+                sentStore.Deliver("Sent", this.Data)
             }
             this.Data = ""
             this.resetEnvelope()
@@ -644,6 +657,7 @@ public class SmtpServer {
     private Relay:     MailRelay     // submission relay (null = receive-only)
     private Resolver:  StoreResolver // per-user store routing (null = shared)
     private Filter:    InboundFilter // inbound anti-spam filter (null = none)
+    private SaveSent:  bool         // submission: copy authed sender's msg to "Sent"
 
     public SmtpServer(store: MailStore, host: string) {
         this.Store   = store
@@ -657,6 +671,7 @@ public class SmtpServer {
         this.Relay   = null
         this.Resolver = null
         this.Filter  = null
+        this.SaveSent = false
     }
 
     public void AddPassword(string name, string plaintext) { this.Users.Set(name, Password.Hash(plaintext)) }
@@ -681,6 +696,7 @@ public class SmtpServer {
     public SmtpServer WithStoreResolver(Closure<string, MailStore> fn) { this.Resolver = new StoreResolver(fn); return this }
     // Inject an inbound anti-spam filter (SPF/DKIM/DMARC/greylisting/scoring).
     public SmtpServer WithInboundFilter(Closure<InboundMsg, FilterVerdict> fn) { this.Filter = new InboundFilter(fn); return this }
+    public SmtpServer WithSaveToSent(bool on) { this.SaveSent = on; return this }
 
     // Blocking accept loop on `port`. One connection at a time.
     public void Serve(int port) {
@@ -722,6 +738,7 @@ public class SmtpServer {
         if (this.Relay != null) { sess.WithRelay(this.Relay.Fn) }
         if (this.Resolver != null) { sess.Resolver = this.Resolver }
         if (this.Filter != null) { sess.WithInboundFilter(this.Filter.Fn) }
+        if (this.SaveSent) { sess.WithSaveToSent(true) }
         sess.PeerIp = ip
 
         // Anti-slowloris: a stalled recv() unblocks after the timeout
