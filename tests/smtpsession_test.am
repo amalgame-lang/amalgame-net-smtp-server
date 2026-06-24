@@ -219,5 +219,62 @@ public class Program {
         if (String_Contains(nrr, "250") && String_Contains(nrf, "551")) {
             Console.WriteLine("[PASS] no-relay external rejected")
         } else { Console.WriteLine("[FAIL] no-relay external: r=" + nrr + " fin=" + nrf) }
+
+        // ── 18. inbound filter: reject → 550 with reason, not delivered ──
+        let fr: SmtpSession = new SmtpSession(store, "mail.amalgame.me")
+        fr.WithLocalDomain("amalgame.me")
+        fr.PeerIp = "203.0.113.9"
+        fr.WithInboundFilter(im => {
+            let v = new FilterVerdict()
+            if (String_Contains(im.From, "spammer")) { v.Action = "reject"; v.Reason = "SPF fail for " + im.PeerIp }
+            else if (String_Contains(im.From, "suspicious")) { v.Action = "junk"; v.Reason = "DMARC quarantine" }
+            else { v.Action = "accept" }
+            return v
+        })
+        let fre: string = fr.Feed("EHLO client")
+        let frm: string = fr.Feed("MAIL FROM:<spammer@evil.test>")
+        let frr: string = fr.Feed("RCPT TO:<alice@amalgame.me>")
+        let frd: string = fr.Feed("DATA")
+        let frb: string = fr.Feed("Subject: buy now")
+        let frf: string = fr.Feed(".")
+        if (String_Contains(frf, "550") && String_Contains(frf, "SPF fail") && String_Contains(frf, "203.0.113.9")) {
+            Console.WriteLine("[PASS] inbound filter reject")
+        } else { Console.WriteLine("[FAIL] inbound filter reject: " + frf) }
+
+        // ── 19. inbound filter: junk → delivered to "Junk" mailbox ──
+        let fjk: SmtpSession = new SmtpSession(store, "mail.amalgame.me")
+        fjk.WithLocalDomain("amalgame.me")
+        fjk.WithInboundFilter(im => {
+            let v = new FilterVerdict()
+            if (String_Contains(im.From, "suspicious")) { v.Action = "junk" } else { v.Action = "accept" }
+            return v
+        })
+        let jke: string = fjk.Feed("EHLO client")
+        let jkm: string = fjk.Feed("MAIL FROM:<suspicious@spam.test>")
+        let jkr: string = fjk.Feed("RCPT TO:<alice@amalgame.me>")
+        let jkd: string = fjk.Feed("DATA")
+        let jkb: string = fjk.Feed("Subject: maybe spam")
+        let jkf: string = fjk.Feed(".")
+        let junkUid: int = fjk.LastUid
+        let junkBody: string = store.Read("Junk", junkUid)
+        if (String_Contains(jkf, "250") && junkUid > 0 && String_Contains(junkBody, "maybe spam")) {
+            Console.WriteLine("[PASS] inbound filter junk → Junk mailbox")
+        } else { Console.WriteLine("[FAIL] inbound filter junk: fin=" + jkf + " uid=" + String_FromInt(junkUid)) }
+
+        // ── 20. inbound filter: accept → normal INBOX delivery ──
+        let fac: SmtpSession = new SmtpSession(store, "mail.amalgame.me")
+        fac.WithLocalDomain("amalgame.me")
+        fac.WithInboundFilter(im => { let v = new FilterVerdict(); v.Action = "accept"; return v })
+        let ace: string = fac.Feed("EHLO client")
+        let acm: string = fac.Feed("MAIL FROM:<friend@good.test>")
+        let acr: string = fac.Feed("RCPT TO:<alice@amalgame.me>")
+        let acd: string = fac.Feed("DATA")
+        let acb: string = fac.Feed("Subject: hello friend ok")
+        let acf: string = fac.Feed(".")
+        let accUid: int = fac.LastUid
+        let accBody: string = store.Read("INBOX", accUid)
+        if (String_Contains(acf, "250") && accUid > 0 && String_Contains(accBody, "hello friend ok")) {
+            Console.WriteLine("[PASS] inbound filter accept → INBOX")
+        } else { Console.WriteLine("[FAIL] inbound filter accept: fin=" + acf + " uid=" + String_FromInt(accUid)) }
     }
 }
