@@ -116,6 +116,29 @@ public class StoreResolver {
     public StoreResolver(Closure<string, MailStore> fn) { this.Fn = fn }
 }
 
+// Inbound anti-spam filter. At end-of-DATA, for LOCAL recipients, the server
+// hands the message context to an injected closure which returns a verdict:
+//   Action = "accept" (default, → INBOX) | "reject" (→ 550, mail refused)
+//          | "defer" (→ 451, temporary — used by greylisting) | "junk"
+//          (delivered to the recipient's "Junk" mailbox instead of INBOX).
+// Keeps the package free of any SPF/DKIM/DMARC dependency (logic is injected).
+public class InboundMsg {
+    public PeerIp: string     // connecting client IP (for SPF)
+    public From:   string     // envelope MAIL FROM
+    public To:     string     // first local recipient
+    public Data:   string     // full message (headers + body)
+    public InboundMsg() { this.PeerIp = ""; this.From = ""; this.To = ""; this.Data = "" }
+}
+public class FilterVerdict {
+    public Action: string     // "accept" | "reject" | "defer" | "junk"
+    public Reason: string     // human-readable, sent in the SMTP reply / logged
+    public FilterVerdict() { this.Action = "accept"; this.Reason = "" }
+}
+public class InboundFilter {
+    public Fn: Closure<InboundMsg, FilterVerdict>
+    public InboundFilter(Closure<InboundMsg, FilterVerdict> fn) { this.Fn = fn }
+}
+
 public class SmtpSession {
     public  Store:    MailStore
     public  Users:    Map<string, string>   // username → scrypt hash
@@ -147,6 +170,8 @@ public class SmtpSession {
     private MaxAuthFails: int       // lock AUTH after this many failures
     private Relay:        MailRelay // submission relay (null = receive-only)
     public  Resolver:     StoreResolver // per-user store routing (null = shared)
+    public  PeerIp:       string    // connecting client IP (set by transport, for SPF)
+    private Filter:       InboundFilter // inbound anti-spam filter (null = none)
 
     public SmtpSession(store: MailStore, host: string) {
         this.Store    = store
@@ -170,6 +195,8 @@ public class SmtpSession {
         this.Upgrade   = false
         this.LastUid   = 0
         this.LocalDomain  = ""
+        this.PeerIp       = ""
+        this.Filter       = null
         this.MaxSize      = 52428800   // 50 MiB
         this.MaxRcpts     = 100
         this.MaxAuthFails = 5
@@ -196,6 +223,10 @@ public class SmtpSession {
     // Without it the server is receive-only (authed external RCPT → 551 at
     // end-of-DATA). Keeps this package free of any mail-send dependency.
     public SmtpSession WithRelay(Closure<RelayMsg, bool> fn) { this.Relay = new MailRelay(fn); return this }
+    // Inject an inbound anti-spam filter (SPF/DKIM/DMARC/greylisting/scoring).
+    // Applied at end-of-DATA to LOCAL recipients; the closure returns a verdict
+    // (accept/reject/defer/junk). Null = no filtering (legacy behaviour).
+    public SmtpSession WithInboundFilter(Closure<InboundMsg, FilterVerdict> fn) { this.Filter = new InboundFilter(fn); return this }
     public bool IsQuit() { return this.Quit }
     // STARTTLS was accepted; the transport must perform the TLS handshake
     // then call SetTlsActive(true) (which also clears it).
@@ -363,9 +394,28 @@ public class SmtpSession {
                     relayFailed = true
                 }
             }
+            // Inbound anti-spam filter (SPF/DKIM/DMARC/greylisting/scoring) —
+            // once per message, applied to all local recipients. reject → 550,
+            // defer → 451 (greylisting retry), junk → "Junk" mailbox.
+            var localTarget: string = "INBOX"
+            if (locals.Count() > 0 && this.Filter != null) {
+                let imsg = new InboundMsg()
+                imsg.PeerIp = this.PeerIp; imsg.From = this.From
+                imsg.To = locals.Get(0); imsg.Data = this.Data
+                let verdict: FilterVerdict = this.Filter.Fn(imsg)
+                if (verdict.Action == "reject") {
+                    this.Data = ""; this.resetEnvelope()
+                    return "550 5.7.1 " + SmtpSession.oneLine(verdict.Reason) + "\r\n"
+                }
+                if (verdict.Action == "defer") {
+                    this.Data = ""; this.resetEnvelope()
+                    return "451 4.7.1 " + SmtpSession.oneLine(verdict.Reason) + "\r\n"
+                }
+                if (verdict.Action == "junk") { localTarget = "Junk" }
+            }
             // Local recipients : with a per-user store resolver, each gets the
-            // message in ITS OWN store (INBOX) ; without one, deliver once to the
-            // shared store/mailbox (legacy).
+            // message in ITS OWN store (INBOX/Junk) ; without one, deliver once to
+            // the shared store/mailbox (legacy).
             var localUid: int = 0
             var localFailed: bool = false
             if (locals.Count() > 0) {
@@ -373,12 +423,13 @@ public class SmtpSession {
                     var li: int = 0
                     while (li < locals.Count()) {
                         let st: MailStore = this.Resolver.Fn(SmtpSession.localPartOf(locals.Get(li)))
-                        let u: int = st.Deliver("INBOX", this.Data)
+                        let u: int = st.Deliver(localTarget, this.Data)
                         if (u > 0) { localUid = u } else { localFailed = true }
                         li = li + 1
                     }
                 } else {
-                    localUid = this.Store.Deliver(this.Mailbox, this.Data)
+                    let legacyBox: string = localTarget == "Junk" ? "Junk" : this.Mailbox
+                    localUid = this.Store.Deliver(legacyBox, this.Data)
                     if (localUid <= 0) { localFailed = true }
                 }
             }
@@ -517,6 +568,15 @@ public class SmtpSession {
         if (at < 0) { return String_ToLower(addr) }
         return String_ToLower(String_Substring(addr, 0, at))
     }
+    // Collapse CR/LF to spaces so a filter reason can't inject extra SMTP reply
+    // lines (response splitting). Trimmed to a safe length.
+    private static string oneLine(string s) {
+        var r: string = String_Replace(s, "\r", " ")
+        r = String_Replace(r, "\n", " ")
+        if (String_Length(r) > 200) { r = String_Substring(r, 0, 200) }
+        if (String_Length(r) == 0) { r = "message rejected" }
+        return r
+    }
 
     // ── base64 (inline; no dependency) ────────────────
 
@@ -583,6 +643,7 @@ public class SmtpServer {
     private DnsblZone: string
     private Relay:     MailRelay     // submission relay (null = receive-only)
     private Resolver:  StoreResolver // per-user store routing (null = shared)
+    private Filter:    InboundFilter // inbound anti-spam filter (null = none)
 
     public SmtpServer(store: MailStore, host: string) {
         this.Store   = store
@@ -595,6 +656,7 @@ public class SmtpServer {
         this.DnsblZone = ""
         this.Relay   = null
         this.Resolver = null
+        this.Filter  = null
     }
 
     public void AddPassword(string name, string plaintext) { this.Users.Set(name, Password.Hash(plaintext)) }
@@ -617,6 +679,8 @@ public class SmtpServer {
     // Inject per-user store routing for inbound delivery: each local recipient's
     // mail is delivered to the store returned by fn(local-part), not a shared one.
     public SmtpServer WithStoreResolver(Closure<string, MailStore> fn) { this.Resolver = new StoreResolver(fn); return this }
+    // Inject an inbound anti-spam filter (SPF/DKIM/DMARC/greylisting/scoring).
+    public SmtpServer WithInboundFilter(Closure<InboundMsg, FilterVerdict> fn) { this.Filter = new InboundFilter(fn); return this }
 
     // Blocking accept loop on `port`. One connection at a time.
     public void Serve(int port) {
@@ -637,15 +701,15 @@ public class SmtpServer {
                     SmtpServer.sendFd(fd, "554 5.7.1 " + ip + " blocked (listed in " + this.DnsblZone + ")\r\n")
                     @c { close((int) fd); }
                 } else {
-                    this.handle(fd)
+                    this.handle(fd, ip)
                 }
             }
         }
         TcpServer_Close(srv)
     }
 
-    // One connection, identified by its socket fd.
-    private void handle(int fd) {
+    // One connection, identified by its socket fd + the peer IP (for SPF).
+    private void handle(int fd, string ip) {
         let sess: SmtpSession = new SmtpSession(this.Store, this.Host)
         if (String_Length(this.LocalDomain) > 0) { sess.WithLocalDomain(this.LocalDomain) }
         let keys: List<string> = this.Users.Keys()
@@ -657,6 +721,8 @@ public class SmtpServer {
         }
         if (this.Relay != null) { sess.WithRelay(this.Relay.Fn) }
         if (this.Resolver != null) { sess.Resolver = this.Resolver }
+        if (this.Filter != null) { sess.WithInboundFilter(this.Filter.Fn) }
+        sess.PeerIp = ip
 
         // Anti-slowloris: a stalled recv() unblocks after the timeout
         // (recv returns 0 → we drop the connection). Critical for a
