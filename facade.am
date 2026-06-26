@@ -316,8 +316,8 @@ public class SmtpSession {
         // of our own users (MAIL FROM in the local domain).
         if (!this.Authed && String_Length(this.LocalDomain) > 0 && String_Length(addr) > 0) {
             let fd: string = SmtpSession.domainOf(addr)
-            if (fd == this.LocalDomain) {
-                return "550 5.7.1 Authentication required to send as " + this.LocalDomain + "\r\n"
+            if (SmtpSession.domainLocal(fd, this.LocalDomain)) {
+                return "550 5.7.1 Authentication required to send as " + fd + "\r\n"
             }
         }
         this.From = addr
@@ -337,7 +337,7 @@ public class SmtpSession {
         // Rejected HERE (during the transaction), never accepted-then-bounced.
         if (!this.Authed && String_Length(this.LocalDomain) > 0) {
             let rd: string = SmtpSession.domainOf(addr)
-            if (rd != this.LocalDomain) {
+            if (!SmtpSession.domainLocal(rd, this.LocalDomain)) {
                 return "550 5.7.1 Relaying denied: " + addr + " is not local\r\n"
             }
         }
@@ -378,7 +378,7 @@ public class SmtpSession {
                 var ri: int = 0
                 while (ri < this.Rcpts.Count()) {
                     let r: string = this.Rcpts.Get(ri)
-                    if (SmtpSession.domainOf(r) == this.LocalDomain) { locals.Add(r) }
+                    if (SmtpSession.domainLocal(SmtpSession.domainOf(r), this.LocalDomain)) { locals.Add(r) }
                     else { externals.Add(r) }
                     ri = ri + 1
                 }
@@ -428,7 +428,7 @@ public class SmtpSession {
                 if (this.Resolver != null) {
                     var li: int = 0
                     while (li < locals.Count()) {
-                        let st: MailStore = this.Resolver.Fn(SmtpSession.localPartOf(locals.Get(li)))
+                        let st: MailStore = this.Resolver.Fn(locals.Get(li))   // adresse complète → routage multi-domaine côté résolveur
                         let u: int = st.Deliver(localTarget, this.Data)
                         if (u > 0) { localUid = u } else { localFailed = true }
                         li = li + 1
@@ -575,6 +575,21 @@ public class SmtpSession {
         if (at < 0) { return "" }
         return String_ToLower(String_Substring(addr, at + 1, String_Length(addr) - at - 1))
     }
+    // `domain` appartient-il à la liste CSV des domaines locaux (insensible à la
+    // casse) ? Permet à un serveur d'être MX de PLUSIEURS domaines (multi-tenant) :
+    // WithLocalDomain accepte "a.tld,b.tld" et chaque comparaison passe par ici.
+    private static bool domainLocal(string domain, string localCsv) {
+        if (String_Length(localCsv) == 0) { return false }
+        let d: string = String_ToLower(domain)
+        if (String_Length(d) == 0) { return false }
+        let parts: List<string> = String_Split(localCsv, ",")
+        var i: int = 0
+        while (i < parts.Count()) {
+            if (String_ToLower(parts.Get(i)) == d) { return true }
+            i = i + 1
+        }
+        return false
+    }
     // Lowercased local part ("USER@domain" → "user"), for per-user routing.
     private static string localPartOf(string addr) {
         let at: int = String_IndexOf(addr, "@")
@@ -683,6 +698,18 @@ public class SmtpServer {
     // The domain this server is MX for — enables anti-relay + anti-spoof
     // (unauthenticated senders may only deliver to local recipients).
     public SmtpServer WithLocalDomain(string domain) { this.LocalDomain = domain; return this }
+    // Plusieurs domaines locaux (multi-tenant) : ce serveur est MX de chacun.
+    // Stocké en CSV ; l'appartenance est testée par SmtpSession.domainLocal.
+    public SmtpServer WithLocalDomains(List<string> domains) {
+        var csv: string = ""
+        var i: int = 0
+        while (i < domains.Count()) {
+            if (String_Length(csv) > 0) { csv = csv + "," }
+            csv = csv + domains.Get(i)
+            i = i + 1
+        }
+        this.LocalDomain = csv; return this
+    }
     // Reject connecting IPs listed in this DNSBL zone (e.g.
     // "zen.spamhaus.org"). "" = no DNSBL check.
     public SmtpServer WithDnsbl(string zone) { this.DnsblZone = zone; return this }
